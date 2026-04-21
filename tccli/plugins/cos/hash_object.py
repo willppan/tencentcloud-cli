@@ -37,8 +37,6 @@ def _calculate_local_hash(file_path, hash_type="md5"):
 
 def hash_object(args, parsed_globals):
     """计算本地文件或 COS 对象的哈希值"""
-    client, region = init_cos_client(parsed_globals)
-
     hash_type = (args.get("hash_type", "md5") or "md5").lower()
     local_path = args.get("local_path", "") or ""
     bucket = args.get("bucket", "") or ""
@@ -48,7 +46,7 @@ def hash_object(args, parsed_globals):
         print("Error: 请指定 --local_path 或 --bucket + --cos_key")
         return
 
-    # 计算本地文件哈希
+    # 计算本地文件哈希（纯本地计算，无需凭据）
     if local_path:
         if not os.path.exists(local_path):
             print("Error: 本地文件不存在: %s" % local_path)
@@ -61,8 +59,13 @@ def hash_object(args, parsed_globals):
         print("本地文件: %s" % local_path)
         print("%s: %s" % (hash_type.upper(), result))
 
-    # 获取 COS 对象哈希信息
+    # 获取 COS 对象哈希信息（需要凭据）
     if bucket and cos_key:
+        try:
+            client, region = init_cos_client(parsed_globals)
+        except Exception as e:
+            print("Error: %s" % str(e))
+            return
         try:
             response = client.head_object(
                 Bucket=bucket,

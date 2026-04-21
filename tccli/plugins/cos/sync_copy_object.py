@@ -143,8 +143,9 @@ def sync_copy_object(args, parsed_globals):
             if storage_class:
                 kwargs["StorageClass"] = storage_class
             if metadata:
+                # SDK 命名参数 CopyStatus='Replaced' 对应 x-cos-metadata-directive
                 kwargs["Metadata"] = metadata
-                kwargs["MetadataDirective"] = "Replaced"
+                kwargs["CopyStatus"] = "Replaced"
             if extra_headers:
                 kwargs.update(extra_headers)
             client.copy(**kwargs)

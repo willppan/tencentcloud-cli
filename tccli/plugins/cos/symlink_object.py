@@ -18,7 +18,7 @@ def create_symlink_object(args, parsed_globals):
 
     kwargs = {
         "Bucket": bucket,
-        "Key": cos_key,
+        "SymlinkName": cos_key,
         "SymlinkTarget": target_key,
     }
     if storage_class:
@@ -44,7 +44,6 @@ def create_symlink_object(args, parsed_globals):
         print("Error: %s (Code: %s, RequestId: %s)" % (
             e.get_error_msg(), e.get_error_code(), e.get_request_id()))
 
-
 def get_symlink_object(args, parsed_globals):
     """获取 COS 对象软链接的目标。对齐 coscli symlink get"""
     client, region = init_cos_client(parsed_globals)
@@ -55,7 +54,7 @@ def get_symlink_object(args, parsed_globals):
     try:
         # SDK 提供 get_symlink 时优先使用
         if hasattr(client, "get_symlink"):
-            response = client.get_symlink(Bucket=bucket, Key=cos_key)
+            response = client.get_symlink(Bucket=bucket, SymlinkName=cos_key)
             target = response.get("x-cos-symlink-target") or response.get("SymlinkTarget", "")
         else:
             # 回退到 head_object 读取头部

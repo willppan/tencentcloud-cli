@@ -177,7 +177,13 @@ def _upload_with_retry(client, monitor, full_path, cos_key, file_size,
             if not disable_crc64:
                 ok, msg = _verify_crc64(client, bucket, cos_key, full_path)
                 if not ok:
-                    raise CosServiceError("PUT", "CRC64Mismatch", 400, "CRC64Mismatch", msg, "")
+                    raise CosServiceError("PUT", {
+                        "code": "CRC64Mismatch",
+                        "message": msg,
+                        "resource": cos_key,
+                        "requestid": "",
+                        "traceid": "",
+                    }, 400)
             monitor.update_ok(file_size, file_id)
             return None
         except CosServiceError as e:
@@ -197,8 +203,13 @@ def _upload_with_retry(client, monitor, full_path, cos_key, file_size,
                         if not disable_crc64:
                             ok, msg = _verify_crc64(client, bucket, cos_key, full_path)
                             if not ok:
-                                raise CosServiceError("PUT", "CRC64Mismatch", 400,
-                                                      "CRC64Mismatch", msg, "")
+                                raise CosServiceError("PUT", {
+                                    "code": "CRC64Mismatch",
+                                    "message": msg,
+                                    "resource": cos_key,
+                                    "requestid": "",
+                                    "traceid": "",
+                                }, 400)
                         monitor.update_ok(file_size, file_id)
                         return None
                     except CosServiceError as e2:

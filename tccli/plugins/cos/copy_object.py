@@ -98,8 +98,11 @@ def _do_copy_once(client, bucket, cos_key, dest_bucket, dest_key, region,
     if storage_class:
         kwargs["StorageClass"] = storage_class
     if metadata:
+        # 指定 Metadata 时需要显式 CopyStatus='Replaced'，否则 SDK 默认 'Copy'
+        # 会继承源元数据而忽略本次设置。CopyStatus 是 SDK 的命名参数，
+        # 对应 HTTP 头 x-cos-metadata-directive。
         kwargs["Metadata"] = metadata
-        kwargs["MetadataDirective"] = "Replaced"
+        kwargs["CopyStatus"] = "Replaced"
     if extra_headers:
         kwargs.update(extra_headers)
     client.copy(**kwargs)

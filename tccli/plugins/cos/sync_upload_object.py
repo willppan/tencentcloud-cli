@@ -184,8 +184,13 @@ def sync_upload_object(args, parsed_globals):
                 if cos_crc:
                     local_crc = calculate_local_crc64(file_info["FullPath"])
                     if local_crc and local_crc != cos_crc:
-                        raise CosServiceError("PUT", "CRC64Mismatch", 400, "CRC64Mismatch",
-                                              "CRC64 不一致（本地=%s, COS=%s）" % (local_crc, cos_crc), "")
+                        raise CosServiceError("PUT", {
+                            "code": "CRC64Mismatch",
+                            "message": "CRC64 不一致（本地=%s, COS=%s）" % (local_crc, cos_crc),
+                            "resource": cos_key,
+                            "requestid": "",
+                            "traceid": "",
+                        }, 400)
                     # 更新快照
                     if snapshot_db is not None and local_crc:
                         snapshot_db.update(cos_key, file_info.get("MTime", 0),

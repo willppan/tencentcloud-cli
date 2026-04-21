@@ -185,8 +185,13 @@ def sync_download_object(args, parsed_globals):
                 if cos_crc:
                     local_crc = calculate_local_crc64(local_file)
                     if local_crc and local_crc != cos_crc:
-                        raise CosServiceError("GET", "CRC64Mismatch", 400, "CRC64Mismatch",
-                                              "CRC64 不一致（本地=%s, COS=%s）" % (local_crc, cos_crc), "")
+                        raise CosServiceError("GET", {
+                            "code": "CRC64Mismatch",
+                            "message": "CRC64 不一致（本地=%s, COS=%s）" % (local_crc, cos_crc),
+                            "resource": cos_key,
+                            "requestid": "",
+                            "traceid": "",
+                        }, 400)
                     if snapshot_db is not None and local_crc:
                         try:
                             snapshot_db.update(cos_key,

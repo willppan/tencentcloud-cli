@@ -157,7 +157,13 @@ def _download_with_retry(client, monitor, cos_key, local_path, file_size,
             if not disable_crc64:
                 ok, msg = _verify_local_crc64(client, bucket, cos_key, local_path, version_id)
                 if not ok:
-                    raise CosServiceError("GET", "CRC64Mismatch", 400, "CRC64Mismatch", msg, "")
+                    raise CosServiceError("GET", {
+                        "code": "CRC64Mismatch",
+                        "message": msg,
+                        "resource": cos_key,
+                        "requestid": "",
+                        "traceid": "",
+                    }, 400)
             monitor.update_ok(file_size, file_id)
             return None
         except CosServiceError as e:
@@ -176,8 +182,13 @@ def _download_with_retry(client, monitor, cos_key, local_path, file_size,
                         if not disable_crc64:
                             ok, msg = _verify_local_crc64(client, bucket, cos_key, local_path, version_id)
                             if not ok:
-                                raise CosServiceError("GET", "CRC64Mismatch", 400,
-                                                      "CRC64Mismatch", msg, "")
+                                raise CosServiceError("GET", {
+                                    "code": "CRC64Mismatch",
+                                    "message": msg,
+                                    "resource": cos_key,
+                                    "requestid": "",
+                                    "traceid": "",
+                                }, 400)
                         monitor.update_ok(file_size, file_id)
                         return None
                     except CosServiceError as e2:

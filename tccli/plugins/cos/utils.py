@@ -11,6 +11,26 @@ import fnmatch
 import threading as _threading
 
 
+# ============================================================
+# SDK header maplist 扩展
+# SDK 的 qcloud_cos.cos_comm.maplist 只预置了部分 HTTP 头映射，
+# 对齐 coscli 所需的若干扩展头（forbid_overwrite/tagging_directive/
+# grant_read_acp/grant_write_acp 等）不在其中；若不扩展，SDK 的
+# mapped() 会直接抛出 "No Parameter Named X Please Check It"。
+# 模块加载时一次性注入，保证后续所有 put_object/upload_file/copy
+# 调用时可以正常透传为 HTTP 头。
+# ============================================================
+try:
+    from qcloud_cos import cos_comm as _cos_comm
+    _cos_comm.maplist.setdefault("ForbidOverwrite", "x-cos-forbid-overwrite")
+    _cos_comm.maplist.setdefault("GrantReadACP", "x-cos-grant-read-acp")
+    _cos_comm.maplist.setdefault("GrantWriteACP", "x-cos-grant-write-acp")
+    _cos_comm.maplist.setdefault("TaggingDirective", "x-cos-tagging-directive")
+except Exception:
+    # SDK 未安装或版本差异时静默忽略，后续调用会自然报错
+    pass
+
+
 def _load_json_file(filepath):
     """加载 JSON 配置文件"""
     try:
