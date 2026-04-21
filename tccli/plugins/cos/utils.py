@@ -4,8 +4,11 @@ COS 插件工具模块
 提供凭据解析、文件过滤、格式化等通用功能
 """
 import os
+import sys
+import time
 import json
 import fnmatch
+import threading as _threading
 
 
 def _load_json_file(filepath):
@@ -147,6 +150,233 @@ def match_filters(name, include, exclude):
     return True
 
 
+# ============================================================
+# 公共参数解析辅助：对齐 coscli 的 cp / sync 的 ACL / SSE / tags 参数
+# ============================================================
+_VALID_ACL = {"default", "private", "public-read", "public-read-write", "authenticated-read",
+              "bucket-owner-read", "bucket-owner-full-control"}
+
+
+def parse_acl_args(args):
+    """
+    解析 ACL 相关参数，返回可用于 put_object / upload_file / copy_object 的 header dict：
+        {"ACL": "...", "GrantRead": "...", "GrantReadACP": "...", ...}
+    支持参数：acl / grant_read / grant_read_acp / grant_write_acp / grant_full_control
+    返回空 dict 表示未设置。
+    """
+    headers = {}
+    acl = args.get("acl", "") or ""
+    if acl and acl in _VALID_ACL:
+        headers["ACL"] = acl
+    for k, sdk_key in (("grant_read", "GrantRead"),
+                       ("grant_read_acp", "GrantReadACP"),
+                       ("grant_write", "GrantWrite"),
+                       ("grant_write_acp", "GrantWriteACP"),
+                       ("grant_full_control", "GrantFullControl")):
+        v = args.get(k, "") or ""
+        if v:
+            headers[sdk_key] = v
+    return headers
+
+
+def parse_sse_args(args):
+    """
+    解析服务端加密参数，返回可直接合并到 upload_file / put_object 的 kwargs dict。
+    - encryption_type / server_side_encryption: "AES256" / "cos/kms"（与 coscli 对齐）
+    - sse_customer_algorithm: SSE-C 算法，固定为 "AES256"
+    - sse_customer_key: SSE-C 密钥（32 字节，Base64 编码或原文，直接透传给 SDK）
+    - sse_customer_key_md5: SSE-C 密钥 MD5
+    """
+    kwargs = {}
+    enc = args.get("encryption_type", "") or args.get("server_side_encryption", "") or ""
+    if enc:
+        # 对齐 coscli：encryption_type=AES256 或 cos/kms
+        kwargs["ServerSideEncryption"] = enc
+    sse_alg = args.get("sse_customer_algorithm", "") or ""
+    sse_key = args.get("sse_customer_key", "") or ""
+    sse_key_md5 = args.get("sse_customer_key_md5", "") or ""
+    if sse_alg:
+        kwargs["SSECustomerAlgorithm"] = sse_alg
+    if sse_key:
+        kwargs["SSECustomerKey"] = sse_key
+    if sse_key_md5:
+        kwargs["SSECustomerKeyMD5"] = sse_key_md5
+    return kwargs
+
+
+def parse_tags(tags_str):
+    """
+    解析对象标签字符串，支持两种分隔符：
+    - "key1=value1&key2=value2"（coscli 风格）
+    - "key1=value1,key2=value2"（tccli 旧风格，兼容）
+    返回 URL 编码后的 "k1=v1&k2=v2" 字符串，可直接作为 x-cos-tagging / Tagging 头使用。
+    空串/无有效键值对时返回空串。
+    """
+    if not tags_str:
+        return ""
+    try:
+        from urllib.parse import quote
+    except ImportError:
+        from urllib import quote
+    # 同时支持 & 和 , 作为分隔符
+    parts = []
+    for seg in tags_str.replace(",", "&").split("&"):
+        seg = seg.strip()
+        if not seg or "=" not in seg:
+            continue
+        k, v = seg.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            continue
+        parts.append("%s=%s" % (quote(k, safe=""), quote(v, safe="")))
+    return "&".join(parts)
+
+
+def build_extra_put_headers(args):
+    """
+    为 put_object / upload_file 构造通用扩展 headers，包括：
+    - ACL / grant_*（来自 parse_acl_args）
+    - 服务端加密（来自 parse_sse_args）
+    - 对象标签（tags）
+    - 禁止覆盖（forbid_overwrite）
+    返回可直接合并到 SDK 调用 kwargs 的 dict。
+    """
+    kwargs = {}
+    kwargs.update(parse_acl_args(args))
+    kwargs.update(parse_sse_args(args))
+    tags = parse_tags(args.get("tags", "") or "")
+    if tags:
+        # SDK 支持 'Tagging' 参数或 'x-cos-tagging' 头
+        kwargs["Tagging"] = tags
+    if args.get("forbid_overwrite", False):
+        # 对齐 coscli 的 --forbid-overwrite，设置 x-cos-forbid-overwrite 头
+        kwargs["ForbidOverwrite"] = "true"
+    return kwargs
+
+
+def build_extra_copy_headers(args):
+    """
+    为 copy_object 构造通用扩展 headers。
+    在 build_extra_put_headers 基础上，按 copy 接口的约定：
+    - 标签默认从源对象继承，若显式指定 tags 则需 TaggingDirective="Replaced"
+    - 元数据同理，已在命令层处理 MetadataDirective
+    """
+    kwargs = build_extra_put_headers(args)
+    if "Tagging" in kwargs:
+        kwargs["TaggingDirective"] = "Replaced"
+    return kwargs
+
+
+# ============================================================
+# SnapshotDB：对齐 coscli 的 --snapshot-path
+# 用于加速同步跳过判断，避免每次都 HEAD + CRC64 计算。
+# 存储格式（JSON）：
+#   {
+#     "__meta__": {"version": 1},
+#     "records": {
+#         "<cos_key>": {"mtime": <float>, "size": <int>, "crc64": "<str>",
+#                        "updated_at": <float>}
+#     }
+#   }
+# ============================================================
+class SnapshotDB(object):
+    """基于 JSON 文件的快照数据库，线程安全。
+
+    使用方式：
+        snap = SnapshotDB.open(path)   # path 为空/None 时返回 None
+        if snap.is_synced(key, mtime, size): ...
+        snap.update(key, mtime, size, crc64)
+        snap.save()  # 批量落盘
+    """
+
+    _VERSION = 1
+
+    def __init__(self, path):
+        self._path = path
+        self._records = {}
+        self._lock = _threading.Lock()
+        self._dirty = False
+
+    @classmethod
+    def open(cls, path):
+        """打开或创建一个 SnapshotDB；path 为空返回 None。"""
+        if not path:
+            return None
+        db = cls(path)
+        try:
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get("records"), dict):
+                    db._records = data["records"]
+        except (IOError, OSError, ValueError):
+            # 损坏的快照文件视为空
+            db._records = {}
+        return db
+
+    def is_synced(self, key, mtime, size):
+        """快速判断：指定 key 在快照中且 {mtime, size} 一致 → 已同步"""
+        if mtime is None or size is None:
+            return False
+        with self._lock:
+            rec = self._records.get(key)
+        if not rec:
+            return False
+        try:
+            # 允许 mtime 微小浮点误差（<= 1s）
+            return (abs(float(rec.get("mtime", 0)) - float(mtime)) <= 1.0 and
+                    int(rec.get("size", -1)) == int(size))
+        except (TypeError, ValueError):
+            return False
+
+    def get_crc64(self, key):
+        with self._lock:
+            rec = self._records.get(key)
+            return rec.get("crc64") if rec else None
+
+    def update(self, key, mtime, size, crc64=None):
+        import time as _time
+        with self._lock:
+            self._records[key] = {
+                "mtime": float(mtime) if mtime is not None else 0.0,
+                "size": int(size) if size is not None else 0,
+                "crc64": crc64 or "",
+                "updated_at": _time.time(),
+            }
+            self._dirty = True
+
+    def remove(self, key):
+        with self._lock:
+            if key in self._records:
+                del self._records[key]
+                self._dirty = True
+
+    def save(self):
+        """将内存中的快照持久化到磁盘（仅 dirty 时执行）"""
+        with self._lock:
+            if not self._dirty:
+                return
+            dirty_records = dict(self._records)
+        try:
+            snap_dir = os.path.dirname(self._path)
+            if snap_dir and not os.path.isdir(snap_dir):
+                os.makedirs(snap_dir, exist_ok=True)
+            data = {
+                "__meta__": {"version": self._VERSION},
+                "records": dirty_records,
+            }
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self._path)
+            with self._lock:
+                self._dirty = False
+        except (IOError, OSError) as e:
+            sys.stderr.write("警告：快照文件保存失败: %s\n" % str(e))
+            sys.stderr.flush()
+
+
 def parse_meta(meta_str):
     """
     解析自定义元数据字符串。
@@ -231,19 +461,59 @@ def list_all_objects_with_dirs(client, bucket, prefix=""):
     return objects
 
 
-def list_local_files(local_dir):
-    """递归列出本地目录下的所有文件"""
+def list_local_files(local_dir, only_current_dir=False,
+                      disable_all_symlink=False, enable_symlink_dir=False):
+    """递归列出本地目录下的所有文件
+
+    - only_current_dir: 仅列出当前目录一层（不递归）
+    - disable_all_symlink: 禁用所有符号链接（文件和目录都跳过）
+    - enable_symlink_dir: 允许跟随符号链接目录（默认不跟随目录链接，文件链接始终跟随，
+      除非 disable_all_symlink=True）
+    """
     files = {}
-    for root, dirs, filenames in os.walk(local_dir):
+    if only_current_dir:
+        # 只列出当前目录一层
+        try:
+            for entry in os.listdir(local_dir):
+                full_path = os.path.join(local_dir, entry)
+                if not os.path.isfile(full_path):
+                    continue
+                if disable_all_symlink and os.path.islink(full_path):
+                    continue
+                files[entry] = {
+                    "Size": os.path.getsize(full_path),
+                    "FullPath": full_path,
+                    "MTime": os.path.getmtime(full_path),
+                }
+        except OSError:
+            pass
+        return files
+
+    # followlinks 控制是否跟随符号链接目录
+    followlinks = enable_symlink_dir and not disable_all_symlink
+    for root, dirs, filenames in os.walk(local_dir, followlinks=followlinks):
+        # 过滤符号链接目录
+        if disable_all_symlink:
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        elif not enable_symlink_dir:
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+
         for filename in filenames:
             full_path = os.path.join(root, filename)
+            # 过滤符号链接文件
+            if disable_all_symlink and os.path.islink(full_path):
+                continue
             rel_path = os.path.relpath(full_path, local_dir)
             rel_path = rel_path.replace(os.sep, "/")
-            files[rel_path] = {
-                "Size": os.path.getsize(full_path),
-                "FullPath": full_path,
-                "MTime": os.path.getmtime(full_path),
-            }
+            try:
+                files[rel_path] = {
+                    "Size": os.path.getsize(full_path),
+                    "FullPath": full_path,
+                    "MTime": os.path.getmtime(full_path),
+                }
+            except OSError:
+                # 符号链接指向不存在的目标等情况
+                continue
     return files
 
 
@@ -319,16 +589,27 @@ def parse_http_time(time_str):
 
 
 def should_skip_sync_upload(client, bucket, cos_key, local_full_path, local_mtime,
-                             ignore_existing=False, update=False):
+                             ignore_existing=False, update=False, snapshot_db=None):
     """
     判断同步上传时是否跳过该文件，对齐 coscli 的 skipUpload。
     跳过规则（优先级从高到低）：
       1. --ignore-existing：目标存在即跳过
       2. --update：目标存在且 Last-Modified >= 本地 mtime 则跳过
-      3. 默认（CRC64）：对比本地 CRC64 与 COS HEAD 的 x-cos-hash-crc64ecma；相等则跳过
+      3. snapshot_db（快速路径）：本地 {mtime, size} 与快照一致 → 直接跳过，无需访问 COS
+      4. 默认（CRC64）：对比本地 CRC64 与 COS HEAD 的 x-cos-hash-crc64ecma；相等则跳过
     返回 True 表示跳过，False 表示需要上传。
     目标不存在、无法获取 CRC64 或比较不相等时均返回 False。
     """
+    # snapshot_db 快速路径：若快照已记录本地文件，则直接跳过（coscli 行为）
+    # ignore_existing 和 update 有更高优先级
+    if not ignore_existing and not update and snapshot_db is not None:
+        try:
+            local_size = os.path.getsize(local_full_path)
+        except OSError:
+            local_size = None
+        if local_size is not None and snapshot_db.is_synced(cos_key, local_mtime, local_size):
+            return True
+
     head = get_object_head(client, bucket, cos_key)
     if head is None:
         return False  # 目标不存在或异常，不跳过
@@ -347,18 +628,27 @@ def should_skip_sync_upload(client, bucket, cos_key, local_full_path, local_mtim
     local_crc = calculate_local_crc64(local_full_path)
     if local_crc is None:
         return False
-    return cos_crc == local_crc
+    skipped = (cos_crc == local_crc)
+    # 若校验一致并启用快照，同步更新快照
+    if skipped and snapshot_db is not None:
+        try:
+            local_size = os.path.getsize(local_full_path)
+            snapshot_db.update(cos_key, local_mtime, local_size, local_crc)
+        except OSError:
+            pass
+    return skipped
 
 
 def should_skip_sync_download(client, bucket, cos_key, cos_head_info, local_full_path,
-                               ignore_existing=False, update=False):
+                               ignore_existing=False, update=False, snapshot_db=None):
     """
     判断同步下载时是否跳过该文件，对齐 coscli 的 skipDownload。
     - cos_head_info: 从 list_objects 得到的对象信息 dict（含 'Size' / 'LastModified' 等）
     跳过规则（优先级从高到低）：
       1. --ignore-existing：本地存在即跳过
       2. --update：本地 mtime >= COS LastModified 则跳过
-      3. 默认（CRC64）：对比本地 CRC64 与 COS HEAD 的 x-cos-hash-crc64ecma；相等则跳过
+      3. snapshot_db（快速路径）：本地 {mtime, size} 与快照一致 → 跳过
+      4. 默认（CRC64）：对比本地 CRC64 与 COS HEAD 的 x-cos-hash-crc64ecma；相等则跳过
     返回 True 表示跳过，False 表示需要下载。
     """
     if not os.path.exists(local_full_path):
@@ -371,6 +661,16 @@ def should_skip_sync_download(client, bucket, cos_key, cos_head_info, local_full
         if remote_ts is not None and local_mtime >= remote_ts:
             return True
         return False
+    # snapshot 快速路径
+    if snapshot_db is not None:
+        try:
+            local_size = os.path.getsize(local_full_path)
+            local_mtime = os.path.getmtime(local_full_path)
+        except OSError:
+            local_size = None
+            local_mtime = None
+        if local_size is not None and snapshot_db.is_synced(cos_key, local_mtime, local_size):
+            return True
     # 默认：CRC64 比较
     local_crc = calculate_local_crc64(local_full_path)
     if local_crc is None:
@@ -381,7 +681,15 @@ def should_skip_sync_download(client, bucket, cos_key, cos_head_info, local_full
     cos_crc = head.get("x-cos-hash-crc64ecma", "")
     if not cos_crc:
         return False
-    return cos_crc == local_crc
+    skipped = (cos_crc == local_crc)
+    if skipped and snapshot_db is not None:
+        try:
+            local_size = os.path.getsize(local_full_path)
+            local_mtime = os.path.getmtime(local_full_path)
+            snapshot_db.update(cos_key, local_mtime, local_size, local_crc)
+        except OSError:
+            pass
+    return skipped
 
 
 def should_skip_sync_copy(client, src_bucket, src_key, dest_bucket, dest_key,
@@ -419,9 +727,6 @@ def should_skip_sync_copy(client, src_bucket, src_key, dest_bucket, dest_key,
 # ============================================================
 # 进度监控模块 - 对齐 COSCLI 的 FileProcessMonitor
 # ============================================================
-import sys
-import time
-import threading as _threading
 
 
 class TransferProgressMonitor(object):
