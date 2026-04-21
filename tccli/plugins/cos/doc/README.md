@@ -37,11 +37,22 @@
 - [标签管理](#标签管理)
   - [get_object_tagging - 获取对象标签](#get_object_tagging---获取对象标签)
   - [put_object_tagging - 设置对象标签](#put_object_tagging---设置对象标签)
+  - [add_object_tagging - 追加对象标签](#add_object_tagging---追加对象标签)
   - [delete_object_tagging - 删除对象标签](#delete_object_tagging---删除对象标签)
+- [对象软链接](#对象软链接)
+  - [create_symlink - 创建对象软链接](#create_symlink---创建对象软链接)
+  - [get_symlink - 查询对象软链接](#get_symlink---查询对象软链接)
+- [存储桶清单](#存储桶清单)
+  - [put_bucket_inventory - 创建/更新清单](#put_bucket_inventory---创建更新清单)
+  - [get_bucket_inventory - 查询清单](#get_bucket_inventory---查询清单)
+  - [list_bucket_inventory - 列出清单任务](#list_bucket_inventory---列出清单任务)
+  - [delete_bucket_inventory - 删除清单任务](#delete_bucket_inventory---删除清单任务)
+  - [post_bucket_inventory - 一次性清单](#post_bucket_inventory---一次性清单)
 - [分片上传管理](#分片上传管理)
   - [lsparts - 列出分片上传](#lsparts---列出分片上传)
   - [abort - 清理分片上传](#abort---清理分片上传)
 - [附录](#附录)
+  - [coscli 参数对齐速查表](#coscli-参数对齐速查表)
   - [存储类型说明](#存储类型说明)
   - [失败日志格式](#失败日志格式)
 
@@ -939,6 +950,24 @@ tccli cos put_object_tagging --bucket my-bucket-1250000000 --cos_key data/test.t
 
 ---
 
+### add_object_tagging - 追加对象标签
+
+追加 COS 对象标签（合并已有标签，同 key 则覆盖旧值）。对齐 coscli `object-tagging add`。
+
+**命令格式：**
+```bash
+tccli cos add_object_tagging --bucket <存储桶名称> --cos_key <对象键> --tags "k1=v1,k2=v2"
+```
+
+**示例：**
+```bash
+# 在已有标签基础上追加
+tccli cos add_object_tagging --bucket my-bucket-1250000000 --cos_key data/test.txt \
+  --tags "owner=team2,version=v2"
+```
+
+---
+
 ### delete_object_tagging - 删除对象标签
 
 删除 COS 对象的所有标签。
@@ -951,6 +980,98 @@ tccli cos delete_object_tagging --bucket <存储桶名称> --cos_key <对象键>
 **示例：**
 ```bash
 tccli cos delete_object_tagging --bucket my-bucket-1250000000 --cos_key data/test.txt
+```
+
+---
+
+## 对象软链接
+
+### create_symlink - 创建对象软链接
+
+创建 COS 对象软链接（symlink），指向另一个对象。对齐 coscli `symlink create`。
+
+**命令格式：**
+```bash
+tccli cos create_symlink --bucket <存储桶> --cos_key <软链接对象键> --target_key <目标对象键> [--storage_class <类型>]
+```
+
+**示例：**
+```bash
+tccli cos create_symlink --bucket my-bucket-1250000000 \
+  --cos_key links/latest.txt --target_key data/v20240101.txt
+```
+
+---
+
+### get_symlink - 查询对象软链接
+
+获取软链接对象指向的目标对象键。对齐 coscli `symlink get`。
+
+**命令格式：**
+```bash
+tccli cos get_symlink --bucket <存储桶> --cos_key <软链接对象键>
+```
+
+---
+
+## 存储桶清单
+
+COS 存储桶清单（Inventory）用于定期或一次性导出桶内对象列表到指定的目标桶中，常用于大规模数据分析。对齐 coscli `inventory` 命令。
+
+### put_bucket_inventory - 创建/更新清单
+
+**命令格式：**
+```bash
+tccli cos put_bucket_inventory --bucket <存储桶> --id <任务ID> \
+  [--frequency Daily|Weekly] [--included_object_versions Current|All] \
+  [--prefix <过滤前缀>] [--fields "Size,LastModifiedDate,StorageClass,ETag"] \
+  --dest_bucket qcs::cos:<region>::<目标桶名> [--dest_account_id <uin>] \
+  [--dest_prefix <key前缀>] [--dest_format CSV|ORC]
+```
+
+**参数说明：**
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `--bucket` | string | ✅ | - | 存储桶名称 |
+| `--id` | string | ✅ | - | 清单任务 ID |
+| `--is_enabled` | bool | ❌ | true | 是否启用该清单任务 |
+| `--frequency` | string | ❌ | Daily | 生成频率：Daily / Weekly |
+| `--included_object_versions` | string | ❌ | Current | 清单版本范围：Current / All |
+| `--prefix` | string | ❌ | 空 | 过滤源对象前缀 |
+| `--fields` | string | ❌ | 空 | 可选字段列表，逗号分隔 |
+| `--dest_bucket` | string | ❌ | 空 | 清单结果目标桶（QCS 格式） |
+| `--dest_account_id` | string | ❌ | 空 | 清单结果目标账号 ID |
+| `--dest_prefix` | string | ❌ | 空 | 清单结果 key 前缀 |
+| `--dest_format` | string | ❌ | CSV | 清单结果格式：CSV / ORC |
+
+---
+
+### get_bucket_inventory - 查询清单
+
+```bash
+tccli cos get_bucket_inventory --bucket <存储桶> --id <任务ID>
+```
+
+### list_bucket_inventory - 列出清单任务
+
+```bash
+tccli cos list_bucket_inventory --bucket <存储桶>
+```
+
+### delete_bucket_inventory - 删除清单任务
+
+```bash
+tccli cos delete_bucket_inventory --bucket <存储桶> --id <任务ID>
+```
+
+### post_bucket_inventory - 一次性清单
+
+一次性触发清单任务（Frequency 固定为 Once），参数与 `put_bucket_inventory` 一致。对齐 coscli `inventory post`。
+
+```bash
+tccli cos post_bucket_inventory --bucket <存储桶> --id <任务ID> \
+  --dest_bucket qcs::cos:<region>::<目标桶名>
 ```
 
 ---
@@ -1018,6 +1139,58 @@ tccli cos abort --bucket my-bucket-1250000000 --cos_key data/large.zip \
 ---
 
 ## 附录
+
+### coscli 参数对齐速查表
+
+本插件全量对齐 coscli 的核心命令与参数。参数命名风格保留 tccli 约定（`snake_case`），与 coscli 的 `kebab-case` 一一对应。
+
+**单文件传输（upload / download / copy）新增参数：**
+
+| tccli 参数 | coscli 参数 | 说明 |
+|---|---|---|
+| `--fail_output` / `--fail_output_path` | `--fail-output` / `--fail-output-path` | 启用并指定失败日志路径 |
+| `--err_retry_num` / `--err_retry_interval` | `--err-retry-num` / `--err-retry-interval` | 可重试错误（超时/5xx/429）的额外重试次数与间隔（秒） |
+| `--only_current_dir` | `--only-current-dir` | 仅当前目录层，不递归 |
+| `--skip_dir` | `--skip-dir` | 不创建空目录标记 |
+| `--disable_crc64` | `--disable-crc64` | 关闭 CRC64 校验 |
+| `--disable_all_symlink` | `--disable-all-symlink` | 禁用所有符号链接 |
+| `--enable_symlink_dir` | `--enable-symlink-dir` | 允许跟随符号链接目录 |
+| `--version_id` | `--version-id` | 指定版本 ID（download/copy/delete） |
+| `--acl` / `--grant_read` / `--grant_read_acp` / `--grant_write_acp` / `--grant_full_control` | 同名 | 上传/复制时设置 ACL 或授权 |
+| `--tags` | `--tags`（格式 `k1=v1&k2=v2`） | 上传/复制时设置对象标签 |
+| `--forbid_overwrite` | `--forbid-overwrite` | 禁止覆盖同名对象 |
+| `--encryption_type` | `--encryption-type` | 服务端加密类型 `AES256` / `cos/kms` |
+| `--sse_customer_algorithm` / `--sse_customer_key` / `--sse_customer_key_md5` | 同名 | SSE-C 自定义密钥加密 |
+
+**同步传输（sync_upload / sync_download / sync_copy）新增参数：**
+
+| tccli 参数 | coscli 参数 | 说明 |
+|---|---|---|
+| `--snapshot_path` | `--snapshot-path` | 本地 JSON 快照数据库，加速增量判断 |
+| `--delete_extra` / `--delete` | `--delete` | 删除目标端多余文件；两者等价 |
+| `--backup_dir` | `--backup-dir` | 删除多余文件前先备份到该目录（sync_upload 备份远端对象到本地；sync_download 备份本地文件到本地） |
+| `--ignore_empty_file` | `--ignore-empty-file` | 忽略 0 字节文件 |
+| `--force` | `--force` | 跳过确认（当前 sync 无交互，保留作兼容） |
+| `--ignore_existing` / `--update` | 同名 | 跳过策略（配合默认 CRC64 校验） |
+
+**跳过策略优先级（对齐 coscli sync）：**
+
+1. `--ignore_existing`：目标存在即跳过
+2. `--update`：源端 Last-Modified 更新时才传输
+3. `--snapshot_path`：本地 `{mtime, size}` 与快照一致时快速跳过
+4. 默认：CRC64 校验（对比对端 `x-cos-hash-crc64ecma`）
+
+**其他扩展：**
+
+- `list` 新增 `--all_versions` / `--limit`
+- `restore` 新增 `--fail_output` / `--fail_output_path`
+- `object-tagging` 新增 `add_object_tagging` 子命令（合并追加）
+- 新增 `create_symlink` / `get_symlink`（对齐 coscli symlink）
+- 新增 `put_bucket_inventory` / `get_bucket_inventory` / `list_bucket_inventory` / `delete_bucket_inventory` / `post_bucket_inventory`（对齐 coscli inventory）
+
+**说明：** coscli 的 `config init/add/set/show/delete` 不在本插件实现，凭据与 profile 管理请统一使用 `tccli configure`。
+
+---
 
 ### 存储类型说明
 
