@@ -271,32 +271,45 @@ def build_extra_copy_headers(args):
 # ============================================================
 # SnapshotDB：对齐 coscli 的 --snapshot-path
 # 用于加速同步跳过判断，避免每次都 HEAD + CRC64 计算。
-# 存储格式（JSON）：
-#   {
-#     "__meta__": {"version": 1},
-#     "records": {
-#         "<cos_key>": {"mtime": <float>, "size": <int>, "crc64": "<str>",
-#                        "updated_at": <float>}
-#     }
-#   }
+# 使用 Python 标准库 sqlite3 作为后端（零额外依赖，跨平台），
+# 对齐 coscli 使用 LevelDB 文件型 KV 的思路。
+#
+# 表结构：
+#   CREATE TABLE IF NOT EXISTS snapshot (
+#       key        TEXT PRIMARY KEY,
+#       mtime      REAL NOT NULL,
+#       size       INTEGER NOT NULL,
+#       crc64      TEXT,
+#       updated_at REAL NOT NULL
+#   )
 # ============================================================
 class SnapshotDB(object):
-    """基于 JSON 文件的快照数据库，线程安全。
+    """基于 SQLite 文件的快照数据库，线程安全。
 
     使用方式：
         snap = SnapshotDB.open(path)   # path 为空/None 时返回 None
         if snap.is_synced(key, mtime, size): ...
-        snap.update(key, mtime, size, crc64)
-        snap.save()  # 批量落盘
+        snap.update(key, mtime, size, crc64)  # 即时 UPSERT 并 commit
+        snap.save()                           # 做最终 commit + close（幂等）
+
+    特性：
+      - 每个线程持有自己的 connection（通过 threading.local），避免
+        SQLite 同连接跨线程使用的限制；并发场景下通过 SQLite 的文件锁
+        自动串行化写入。
+      - WAL 模式 + synchronous=NORMAL，在崩溃安全与吞吐之间做平衡。
+      - update() 即时写库并 commit，Ctrl+C 时也不会丢失已同步记录。
     """
 
     _VERSION = 1
 
     def __init__(self, path):
         self._path = path
-        self._records = {}
-        self._lock = _threading.Lock()
-        self._dirty = False
+        # 每个线程独立 connection
+        self._tls = _threading.local()
+        # 仅用于保护 connection 集合（用于 save 时统一 close 所有连接）
+        self._conns_lock = _threading.Lock()
+        self._conns = []
+        self._closed = False
 
     @classmethod
     def open(cls, path):
@@ -304,77 +317,139 @@ class SnapshotDB(object):
         if not path:
             return None
         db = cls(path)
+        # 预先确保父目录存在并初始化表结构
+        snap_dir = os.path.dirname(path)
+        if snap_dir and not os.path.isdir(snap_dir):
+            try:
+                os.makedirs(snap_dir, exist_ok=True)
+            except OSError as e:
+                sys.stderr.write("警告：创建快照目录失败: %s\n" % str(e))
+                sys.stderr.flush()
         try:
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and isinstance(data.get("records"), dict):
-                    db._records = data["records"]
-        except (IOError, OSError, ValueError):
-            # 损坏的快照文件视为空
-            db._records = {}
+            conn = db._get_conn()
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS snapshot ("
+                "  key TEXT PRIMARY KEY,"
+                "  mtime REAL NOT NULL,"
+                "  size INTEGER NOT NULL,"
+                "  crc64 TEXT,"
+                "  updated_at REAL NOT NULL"
+                ")"
+            )
+            conn.commit()
+        except Exception as e:
+            sys.stderr.write("警告：打开快照数据库失败: %s\n" % str(e))
+            sys.stderr.flush()
         return db
+
+    def _get_conn(self):
+        """为当前线程懒创建一个 sqlite3 connection。"""
+        import sqlite3
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            return conn
+        # check_same_thread=True 是默认值，但我们为每个线程独立建连接，所以允许保持默认
+        conn = sqlite3.connect(self._path, timeout=30.0, isolation_level=None)
+        # 性能与并发相关 pragma
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+        except Exception:
+            pass
+        self._tls.conn = conn
+        with self._conns_lock:
+            self._conns.append(conn)
+        return conn
 
     def is_synced(self, key, mtime, size):
         """快速判断：指定 key 在快照中且 {mtime, size} 一致 → 已同步"""
-        if mtime is None or size is None:
-            return False
-        with self._lock:
-            rec = self._records.get(key)
-        if not rec:
+        if mtime is None or size is None or self._closed:
             return False
         try:
+            conn = self._get_conn()
+            cur = conn.execute(
+                "SELECT mtime, size FROM snapshot WHERE key=? LIMIT 1", (key,)
+            )
+            row = cur.fetchone()
+        except Exception:
+            return False
+        if not row:
+            return False
+        try:
+            rec_mtime, rec_size = row
             # 允许 mtime 微小浮点误差（<= 1s）
-            return (abs(float(rec.get("mtime", 0)) - float(mtime)) <= 1.0 and
-                    int(rec.get("size", -1)) == int(size))
+            return (abs(float(rec_mtime) - float(mtime)) <= 1.0 and
+                    int(rec_size) == int(size))
         except (TypeError, ValueError):
             return False
 
     def get_crc64(self, key):
-        with self._lock:
-            rec = self._records.get(key)
-            return rec.get("crc64") if rec else None
+        if self._closed:
+            return None
+        try:
+            conn = self._get_conn()
+            cur = conn.execute(
+                "SELECT crc64 FROM snapshot WHERE key=? LIMIT 1", (key,)
+            )
+            row = cur.fetchone()
+        except Exception:
+            return None
+        return row[0] if row else None
 
     def update(self, key, mtime, size, crc64=None):
-        import time as _time
-        with self._lock:
-            self._records[key] = {
-                "mtime": float(mtime) if mtime is not None else 0.0,
-                "size": int(size) if size is not None else 0,
-                "crc64": crc64 or "",
-                "updated_at": _time.time(),
-            }
-            self._dirty = True
+        """UPSERT 单条记录并立即写入（isolation_level=None 下为自动提交）。"""
+        if self._closed:
+            return
+        try:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO snapshot(key, mtime, size, crc64, updated_at) "
+                "VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "  mtime=excluded.mtime, size=excluded.size, "
+                "  crc64=excluded.crc64, updated_at=excluded.updated_at",
+                (
+                    key,
+                    float(mtime) if mtime is not None else 0.0,
+                    int(size) if size is not None else 0,
+                    crc64 or "",
+                    time.time(),
+                ),
+            )
+        except Exception as e:
+            sys.stderr.write("警告：快照写入失败（key=%s）: %s\n" % (key, str(e)))
+            sys.stderr.flush()
 
     def remove(self, key):
-        with self._lock:
-            if key in self._records:
-                del self._records[key]
-                self._dirty = True
+        if self._closed:
+            return
+        try:
+            conn = self._get_conn()
+            conn.execute("DELETE FROM snapshot WHERE key=?", (key,))
+        except Exception:
+            pass
 
     def save(self):
-        """将内存中的快照持久化到磁盘（仅 dirty 时执行）"""
-        with self._lock:
-            if not self._dirty:
-                return
-            dirty_records = dict(self._records)
-        try:
-            snap_dir = os.path.dirname(self._path)
-            if snap_dir and not os.path.isdir(snap_dir):
-                os.makedirs(snap_dir, exist_ok=True)
-            data = {
-                "__meta__": {"version": self._VERSION},
-                "records": dirty_records,
-            }
-            tmp = self._path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
-            os.replace(tmp, self._path)
-            with self._lock:
-                self._dirty = False
-        except (IOError, OSError) as e:
-            sys.stderr.write("警告：快照文件保存失败: %s\n" % str(e))
-            sys.stderr.flush()
+        """最终落盘并关闭所有线程的 connection（幂等）。
+
+        由于 update/remove 在 isolation_level=None 下已自动提交，
+        save() 主要用于显式关闭连接、触发 WAL checkpoint。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        with self._conns_lock:
+            conns, self._conns = self._conns, []
+        for conn in conns:
+            try:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
+                conn.close()
+            except Exception:
+                pass
 
 
 def parse_meta(meta_str):

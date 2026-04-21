@@ -1166,7 +1166,7 @@ tccli cos abort --bucket my-bucket-1250000000 --cos_key data/large.zip \
 
 | tccli 参数 | coscli 参数 | 说明 |
 |---|---|---|
-| `--snapshot_path` | `--snapshot-path` | 本地 JSON 快照数据库，加速增量判断 |
+| `--snapshot_path` | `--snapshot-path` | 本地 SQLite 快照数据库（零依赖，基于 stdlib `sqlite3`），加速增量判断 |
 | `--delete_extra` / `--delete` | `--delete` | 删除目标端多余文件；两者等价 |
 | `--backup_dir` | `--backup-dir` | 删除多余文件前先备份到该目录（sync_upload 备份远端对象到本地；sync_download 备份本地文件到本地） |
 | `--ignore_empty_file` | `--ignore-empty-file` | 忽略 0 字节文件 |

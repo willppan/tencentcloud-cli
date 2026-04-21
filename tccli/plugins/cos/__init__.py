@@ -672,7 +672,7 @@ _spec = {
                 {"name": "update", "member": "bool", "type": "bool", "required": False,
                  "document": "仅在源文件比目标文件新时更新（按 Last-Modified 比较），默认 false。未指定 --ignore-existing 和 --update 时使用 CRC64 校验判断是否跳过"},
                 {"name": "snapshot_path", "member": "string", "type": "string", "required": False,
-                 "document": "快照数据库文件路径（JSON），用于加速增量判断。对齐 coscli --snapshot-path"},
+                 "document": "快照数据库文件路径（SQLite，零额外依赖），用于加速增量判断。对齐 coscli --snapshot-path"},
                 # 删除多余
                 {"name": "delete_extra", "member": "bool", "type": "bool", "required": False,
                  "document": "是否删除 COS 上多余的文件（本地不存在的），默认 false"},
@@ -773,7 +773,7 @@ _spec = {
                 {"name": "update", "member": "bool", "type": "bool", "required": False,
                  "document": "仅在源文件比目标文件新时更新（按 Last-Modified 比较），默认 false"},
                 {"name": "snapshot_path", "member": "string", "type": "string", "required": False,
-                 "document": "快照数据库文件路径，用于加速增量判断"},
+                 "document": "快照数据库文件路径（SQLite，零额外依赖），用于加速增量判断。对齐 coscli --snapshot-path"},
                 # 删除多余
                 {"name": "delete_extra", "member": "bool", "type": "bool", "required": False,
                  "document": "是否删除本地多余的文件，默认 false"},
