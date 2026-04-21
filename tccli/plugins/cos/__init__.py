@@ -21,10 +21,15 @@ from .signurl_object import signurl_object
 from .acl_object import get_bucket_acl, put_bucket_acl, get_object_acl, put_object_acl
 from .abort_multipart import abort_multipart
 from .hash_object import hash_object
-from .tagging_object import get_object_tagging, put_object_tagging, delete_object_tagging
+from .tagging_object import (get_object_tagging, put_object_tagging,
+                             add_object_tagging, delete_object_tagging)
 from .du_object import du_object
 from .cat_object import cat_object
 from .lsparts_object import lsparts_object
+from .symlink_object import create_symlink_object, get_symlink_object
+from .inventory_bucket import (put_bucket_inventory, get_bucket_inventory,
+                               list_bucket_inventory, delete_bucket_inventory,
+                               post_bucket_inventory)
 
 service_name = "cos"
 service_version = "2021-02-24"
@@ -237,6 +242,65 @@ _spec = {
             "output": "lspartsResponse",
             "action_caller": lsparts_object,
         },
+        # ===== 对象软链接 =====
+        "create_symlink": {
+            "name": "创建对象软链接",
+            "document": "创建 COS 对象软链接（symlink），对齐 coscli symlink create",
+            "input": "create_symlinkRequest",
+            "output": "create_symlinkResponse",
+            "action_caller": create_symlink_object,
+        },
+        "get_symlink": {
+            "name": "查询对象软链接",
+            "document": "获取 COS 对象软链接的目标，对齐 coscli symlink get",
+            "input": "get_symlinkRequest",
+            "output": "get_symlinkResponse",
+            "action_caller": get_symlink_object,
+        },
+        # ===== 标签追加 =====
+        "add_object_tagging": {
+            "name": "追加对象标签",
+            "document": "追加 COS 对象标签（合并已有标签，同 key 覆盖），对齐 coscli object-tagging add",
+            "input": "add_object_taggingRequest",
+            "output": "add_object_taggingResponse",
+            "action_caller": add_object_tagging,
+        },
+        # ===== 存储桶清单 =====
+        "put_bucket_inventory": {
+            "name": "创建/更新存储桶清单",
+            "document": "创建或更新存储桶清单任务，对齐 coscli inventory put",
+            "input": "put_bucket_inventoryRequest",
+            "output": "put_bucket_inventoryResponse",
+            "action_caller": put_bucket_inventory,
+        },
+        "get_bucket_inventory": {
+            "name": "查询存储桶清单",
+            "document": "查询存储桶单个清单任务配置，对齐 coscli inventory get",
+            "input": "get_bucket_inventoryRequest",
+            "output": "get_bucket_inventoryResponse",
+            "action_caller": get_bucket_inventory,
+        },
+        "list_bucket_inventory": {
+            "name": "列出存储桶清单任务",
+            "document": "列出存储桶的所有清单任务，对齐 coscli inventory list",
+            "input": "list_bucket_inventoryRequest",
+            "output": "list_bucket_inventoryResponse",
+            "action_caller": list_bucket_inventory,
+        },
+        "delete_bucket_inventory": {
+            "name": "删除存储桶清单",
+            "document": "删除存储桶的清单任务，对齐 coscli inventory delete",
+            "input": "delete_bucket_inventoryRequest",
+            "output": "delete_bucket_inventoryResponse",
+            "action_caller": delete_bucket_inventory,
+        },
+        "post_bucket_inventory": {
+            "name": "一次性存储桶清单",
+            "document": "一次性触发存储桶清单任务，对齐 coscli inventory post",
+            "input": "post_bucket_inventoryRequest",
+            "output": "post_bucket_inventoryResponse",
+            "action_caller": post_bucket_inventory,
+        },
     },
     "objects": {
         # ===== list 接口参数 =====
@@ -249,7 +313,7 @@ _spec = {
                 {"name": "marker", "member": "string", "type": "string", "required": False,
                  "document": "分页标记，从该标记之后开始列出对象"},
                 {"name": "max_keys", "member": "int64", "type": "int64", "required": False,
-                 "document": "最大返回数量，默认1000，最大1000"},
+                 "document": "最大返回数量，默认1000，最大为 1000 （单次请求）"},
                 {"name": "delimiter", "member": "string", "type": "string", "required": False,
                  "document": "分隔符，通常设为 / 以模拟目录结构"},
                 {"name": "recursive", "member": "bool", "type": "bool", "required": False,
@@ -258,6 +322,10 @@ _spec = {
                  "document": "包含匹配模式，支持通配符，如 *.txt"},
                 {"name": "exclude", "member": "string", "type": "string", "required": False,
                  "document": "排除匹配模式，支持通配符，如 *.log"},
+                {"name": "all_versions", "member": "bool", "type": "bool", "required": False,
+                 "document": "列出对象的所有历史版本，默认 false。对齐 coscli ls --all-versions"},
+                {"name": "limit", "member": "int64", "type": "int64", "required": False,
+                 "document": "列出最多的对象数量上限，默认 0 (不限)。对齐 coscli ls --limit"},
             ],
         },
         "listResponse": {
@@ -578,6 +646,10 @@ _spec = {
                  "document": "包含匹配模式（递归恢复时生效），支持通配符"},
                 {"name": "exclude", "member": "string", "type": "string", "required": False,
                  "document": "排除匹配模式（递归恢复时生效），支持通配符"},
+                {"name": "fail_output", "member": "bool", "type": "bool", "required": False,
+                 "document": "启用失败日志输出，默认 false。对齐 coscli --fail-output"},
+                {"name": "fail_output_path", "member": "string", "type": "string", "required": False,
+                 "document": "失败日志输出路径（--fail_output 为 true 时生效）"},
             ],
         },
         "restoreResponse": {
@@ -1024,6 +1096,122 @@ _spec = {
         "lspartsResponse": {
             "members": [],
         },
+        # ===== create_symlink =====
+        "create_symlinkRequest": {
+            "members": [
+                {"name": "bucket", "member": "string", "type": "string", "required": True,
+                 "document": "存储桶名称"},
+                {"name": "cos_key", "member": "string", "type": "string", "required": True,
+                 "document": "软链接对象键"},
+                {"name": "target_key", "member": "string", "type": "string", "required": True,
+                 "document": "软链接指向的目标对象键"},
+                {"name": "storage_class", "member": "string", "type": "string", "required": False,
+                 "document": "软链接对象的存储类型"},
+            ],
+        },
+        "create_symlinkResponse": {"members": []},
+        # ===== get_symlink =====
+        "get_symlinkRequest": {
+            "members": [
+                {"name": "bucket", "member": "string", "type": "string", "required": True,
+                 "document": "存储桶名称"},
+                {"name": "cos_key", "member": "string", "type": "string", "required": True,
+                 "document": "软链接对象键"},
+            ],
+        },
+        "get_symlinkResponse": {"members": []},
+        # ===== add_object_tagging =====
+        "add_object_taggingRequest": {
+            "members": [
+                {"name": "bucket", "member": "string", "type": "string", "required": True,
+                 "document": "存储桶名称"},
+                {"name": "cos_key", "member": "string", "type": "string", "required": True,
+                 "document": "对象键"},
+                {"name": "tags", "member": "string", "type": "string", "required": True,
+                 "document": "追加的标签列表，格式: key1=value1,key2=value2（同 key 覆盖旧值）"},
+            ],
+        },
+        "add_object_taggingResponse": {"members": []},
+        # ===== inventory put =====
+        "put_bucket_inventoryRequest": {
+            "members": [
+                {"name": "bucket", "member": "string", "type": "string", "required": True,
+                 "document": "存储桶名称"},
+                {"name": "id", "member": "string", "type": "string", "required": True,
+                 "document": "清单任务 ID"},
+                {"name": "is_enabled", "member": "bool", "type": "bool", "required": False,
+                 "document": "是否启用该清单任务，默认 true"},
+                {"name": "frequency", "member": "string", "type": "string", "required": False,
+                 "document": "清单生成频率: Daily(默认) / Weekly"},
+                {"name": "included_object_versions", "member": "string", "type": "string", "required": False,
+                 "document": "清单包含的版本: Current(默认) / All"},
+                {"name": "prefix", "member": "string", "type": "string", "required": False,
+                 "document": "清单过滤前缀"},
+                {"name": "fields", "member": "string", "type": "string", "required": False,
+                 "document": "可选字段列表，逗号分隔，如 Size,LastModifiedDate,StorageClass,ETag"},
+                {"name": "dest_bucket", "member": "string", "type": "string", "required": False,
+                 "document": "清单结果目标存储桶（完整 QCS 格式，如 qcs::cos:ap-guangzhou::my-bucket-1250000000）"},
+                {"name": "dest_account_id", "member": "string", "type": "string", "required": False,
+                 "document": "清单结果目标账号 ID"},
+                {"name": "dest_prefix", "member": "string", "type": "string", "required": False,
+                 "document": "清单结果目标 key 前缀"},
+                {"name": "dest_format", "member": "string", "type": "string", "required": False,
+                 "document": "清单结果格式: CSV(默认) / ORC"},
+            ],
+        },
+        "put_bucket_inventoryResponse": {"members": []},
+        # ===== inventory get =====
+        "get_bucket_inventoryRequest": {
+            "members": [
+                {"name": "bucket", "member": "string", "type": "string", "required": True,
+                 "document": "存储桶名称"},
+                {"name": "id", "member": "string", "type": "string", "required": True,
+                 "document": "清单任务 ID"},
+            ],
+        },
+        "get_bucket_inventoryResponse": {"members": []},
+        # ===== inventory list =====
+        "list_bucket_inventoryRequest": {
+            "members": [
+                {"name": "bucket", "member": "string", "type": "string", "required": True,
+                 "document": "存储桶名称"},
+            ],
+        },
+        "list_bucket_inventoryResponse": {"members": []},
+        # ===== inventory delete =====
+        "delete_bucket_inventoryRequest": {
+            "members": [
+                {"name": "bucket", "member": "string", "type": "string", "required": True,
+                 "document": "存储桶名称"},
+                {"name": "id", "member": "string", "type": "string", "required": True,
+                 "document": "清单任务 ID"},
+            ],
+        },
+        "delete_bucket_inventoryResponse": {"members": []},
+        # ===== inventory post =====
+        "post_bucket_inventoryRequest": {
+            "members": [
+                {"name": "bucket", "member": "string", "type": "string", "required": True,
+                 "document": "存储桶名称"},
+                {"name": "id", "member": "string", "type": "string", "required": True,
+                 "document": "清单任务 ID"},
+                {"name": "included_object_versions", "member": "string", "type": "string", "required": False,
+                 "document": "清单包含的版本: Current(默认) / All"},
+                {"name": "prefix", "member": "string", "type": "string", "required": False,
+                 "document": "清单过滤前缀"},
+                {"name": "fields", "member": "string", "type": "string", "required": False,
+                 "document": "可选字段列表，逗号分隔"},
+                {"name": "dest_bucket", "member": "string", "type": "string", "required": False,
+                 "document": "清单结果目标存储桶"},
+                {"name": "dest_account_id", "member": "string", "type": "string", "required": False,
+                 "document": "清单结果目标账号 ID"},
+                {"name": "dest_prefix", "member": "string", "type": "string", "required": False,
+                 "document": "清单结果目标 key 前缀"},
+                {"name": "dest_format", "member": "string", "type": "string", "required": False,
+                 "document": "清单结果格式: CSV(默认) / ORC"},
+            ],
+        },
+        "post_bucket_inventoryResponse": {"members": []},
     },
     "version": "1.0",
 }
