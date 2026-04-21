@@ -6,10 +6,12 @@ download 操作：从 COS 下载文件到本地
 - routines: 文件间并发数（同时下载的文件数）
 """
 import os
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from qcloud_cos import CosServiceError
-from .utils import init_cos_client, match_filters, TransferProgressMonitor
+from .utils import (init_cos_client, match_filters, TransferProgressMonitor,
+                    calculate_local_crc64)
 
 
 def download_object(args, parsed_globals):
@@ -27,16 +29,42 @@ def download_object(args, parsed_globals):
     part_size = args.get("part_size", 20) or 20
     rate_limiting = args.get("rate_limiting", 0) or 0
     version_id = args.get("version_id", "") or ""
-    log_file = args.get("log_file", "") or ""
     retry = args.get("retry", 3)
     if retry is None:
         retry = 3
     retry = int(retry)
 
+    # === coscli 对齐扩展参数 ===
+    log_file = args.get("log_file", "") or ""
+    fail_output = args.get("fail_output", False)
+    fail_output_path = args.get("fail_output_path", "") or ""
+    effective_log = log_file or (fail_output_path if fail_output else "")
+
+    err_retry_num = int(args.get("err_retry_num", 0) or 0)
+    err_retry_interval = int(args.get("err_retry_interval", 0) or 0)
+
+    only_current_dir = args.get("only_current_dir", False)
+    disable_crc64 = args.get("disable_crc64", False)
+    forbid_overwrite = args.get("forbid_overwrite", False)
+
+    # SSE-C 下载参数（上传时加密过的对象，下载也必须带）
+    sse_customer_algorithm = args.get("sse_customer_algorithm", "") or ""
+    sse_customer_key = args.get("sse_customer_key", "") or ""
+    sse_customer_key_md5 = args.get("sse_customer_key_md5", "") or ""
+
     try:
         if recursive:
             _download_directory(client, bucket, cos_key, local_path, include, exclude,
-                                thread_num, routines, part_size, rate_limiting, version_id, log_file, retry)
+                                thread_num, routines, part_size, rate_limiting, version_id,
+                                effective_log, retry,
+                                err_retry_num=err_retry_num,
+                                err_retry_interval=err_retry_interval,
+                                only_current_dir=only_current_dir,
+                                disable_crc64=disable_crc64,
+                                forbid_overwrite=forbid_overwrite,
+                                sse_customer_algorithm=sse_customer_algorithm,
+                                sse_customer_key=sse_customer_key,
+                                sse_customer_key_md5=sse_customer_key_md5)
         else:
             # 确保本地目录存在
             local_dir = os.path.dirname(local_path)
@@ -44,7 +72,15 @@ def download_object(args, parsed_globals):
                 os.makedirs(local_dir)
 
             _download_single(client, bucket, cos_key, local_path,
-                             thread_num, part_size, rate_limiting, version_id, log_file, retry)
+                             thread_num, part_size, rate_limiting, version_id,
+                             effective_log, retry,
+                             err_retry_num=err_retry_num,
+                             err_retry_interval=err_retry_interval,
+                             disable_crc64=disable_crc64,
+                             forbid_overwrite=forbid_overwrite,
+                             sse_customer_algorithm=sse_customer_algorithm,
+                             sse_customer_key=sse_customer_key,
+                             sse_customer_key_md5=sse_customer_key_md5)
 
     except CosServiceError as e:
         print("Error: %s (Code: %s, RequestId: %s)" % (
@@ -53,7 +89,9 @@ def download_object(args, parsed_globals):
         print("Error: %s" % str(e))
 
 
-def _build_download_kwargs(bucket, cos_key, local_path, thread_num, part_size, rate_limiting, version_id):
+def _build_download_kwargs(bucket, cos_key, local_path, thread_num, part_size, rate_limiting,
+                           version_id, sse_customer_algorithm="", sse_customer_key="",
+                           sse_customer_key_md5=""):
     """构造 download_file 的参数"""
     kwargs = {
         "Bucket": bucket,
@@ -66,17 +104,111 @@ def _build_download_kwargs(bucket, cos_key, local_path, thread_num, part_size, r
         kwargs["TrafficLimit"] = str(int(rate_limiting) * 1024 * 1024 * 8)
     if version_id:
         kwargs["VersionId"] = version_id
+    if sse_customer_algorithm:
+        kwargs["SSECustomerAlgorithm"] = sse_customer_algorithm
+    if sse_customer_key:
+        kwargs["SSECustomerKey"] = sse_customer_key
+    if sse_customer_key_md5:
+        kwargs["SSECustomerKeyMD5"] = sse_customer_key_md5
     return kwargs
 
 
+def _is_retryable_error(e):
+    """判断 CosServiceError 是否属于可重试错误（服务端错误/网络超时类）。"""
+    try:
+        code = int(e.get_status_code() or 0)
+    except Exception:
+        code = 0
+    return code == 0 or code >= 500 or code in (408, 429)
+
+
+def _verify_local_crc64(client, bucket, cos_key, local_path, version_id=""):
+    """下载后 CRC64 校验"""
+    try:
+        head_kwargs = {"Bucket": bucket, "Key": cos_key}
+        if version_id:
+            head_kwargs["VersionId"] = version_id
+        head = client.head_object(**head_kwargs)
+    except Exception:
+        return True, ""
+    cos_crc = head.get("x-cos-hash-crc64ecma", "")
+    if not cos_crc:
+        return True, ""
+    local_crc = calculate_local_crc64(local_path)
+    if local_crc is None:
+        return True, ""
+    if local_crc != cos_crc:
+        return False, "CRC64 不一致（本地=%s, COS=%s）" % (local_crc, cos_crc)
+    return True, ""
+
+
+def _download_with_retry(client, monitor, cos_key, local_path, file_size,
+                         build_kwargs, retry, err_retry_num, err_retry_interval,
+                         bucket, disable_crc64, version_id):
+    """下载 + 重试 + CRC64 校验通用逻辑"""
+    last_err = None
+    progress_cb, file_id = monitor.create_progress_callback(file_size)
+    total_attempts = max(1, retry + 1)
+    for attempt in range(total_attempts):
+        try:
+            kwargs = build_kwargs()
+            kwargs["progress_callback"] = progress_cb
+            client.download_file(**kwargs)
+            if not disable_crc64:
+                ok, msg = _verify_local_crc64(client, bucket, cos_key, local_path, version_id)
+                if not ok:
+                    raise CosServiceError("GET", "CRC64Mismatch", 400, "CRC64Mismatch", msg, "")
+            monitor.update_ok(file_size, file_id)
+            return None
+        except CosServiceError as e:
+            last_err = e
+            if attempt < total_attempts - 1:
+                progress_cb, file_id = monitor.create_progress_callback(file_size)
+            elif err_retry_num > 0 and _is_retryable_error(e):
+                for extra in range(err_retry_num):
+                    if err_retry_interval > 0:
+                        time.sleep(err_retry_interval)
+                    progress_cb, file_id = monitor.create_progress_callback(file_size)
+                    try:
+                        kwargs = build_kwargs()
+                        kwargs["progress_callback"] = progress_cb
+                        client.download_file(**kwargs)
+                        if not disable_crc64:
+                            ok, msg = _verify_local_crc64(client, bucket, cos_key, local_path, version_id)
+                            if not ok:
+                                raise CosServiceError("GET", "CRC64Mismatch", 400,
+                                                      "CRC64Mismatch", msg, "")
+                        monitor.update_ok(file_size, file_id)
+                        return None
+                    except CosServiceError as e2:
+                        last_err = e2
+    return last_err
+
+
 def _download_single(client, bucket, cos_key, local_path,
-                     thread_num, part_size, rate_limiting, version_id, log_file="", retry=3):
+                     thread_num, part_size, rate_limiting, version_id, log_file="", retry=3,
+                     err_retry_num=0, err_retry_interval=0,
+                     disable_crc64=False, forbid_overwrite=False,
+                     sse_customer_algorithm="", sse_customer_key="", sse_customer_key_md5=""):
     """下载单个文件（带进度监控）"""
+    if forbid_overwrite and os.path.exists(local_path):
+        print("Error: 本地文件已存在，--forbid_overwrite 开启，不覆盖: %s" % local_path)
+        return
+
     monitor = TransferProgressMonitor("download")
 
     # 先获取文件大小
     try:
-        head_resp = client.head_object(Bucket=bucket, Key=cos_key)
+        head_kwargs = {"Bucket": bucket, "Key": cos_key}
+        if version_id:
+            head_kwargs["VersionId"] = version_id
+        if sse_customer_algorithm:
+            head_kwargs["SSECustomerAlgorithm"] = sse_customer_algorithm
+        if sse_customer_key:
+            head_kwargs["SSECustomerKey"] = sse_customer_key
+        if sse_customer_key_md5:
+            head_kwargs["SSECustomerKeyMD5"] = sse_customer_key_md5
+        head_resp = client.head_object(**head_kwargs)
         file_size = int(head_resp.get("Content-Length", 0))
     except Exception:
         file_size = 0
@@ -84,25 +216,17 @@ def _download_single(client, bucket, cos_key, local_path,
     monitor.set_scan_info(1, file_size)
     monitor.start()
 
-    progress_cb, file_id = monitor.create_progress_callback(file_size)
-    last_err = None
-    for attempt in range(max(1, retry + 1)):
-        try:
-            kwargs = _build_download_kwargs(bucket, cos_key, local_path,
-                                            thread_num, part_size, rate_limiting, version_id)
-            kwargs["progress_callback"] = progress_cb
-            client.download_file(**kwargs)
-            monitor.update_ok(file_size, file_id)
-            last_err = None
-            break
-        except CosServiceError as e:
-            last_err = e
-            if attempt < retry:
-                progress_cb, file_id = monitor.create_progress_callback(file_size)
+    def _build():
+        return _build_download_kwargs(bucket, cos_key, local_path,
+                                      thread_num, part_size, rate_limiting, version_id,
+                                      sse_customer_algorithm, sse_customer_key, sse_customer_key_md5)
+
+    last_err = _download_with_retry(client, monitor, cos_key, local_path, file_size,
+                                    _build, retry, err_retry_num, err_retry_interval,
+                                    bucket, disable_crc64, version_id)
     if last_err is not None:
         err_reason = "%s (Code: %s)" % (last_err.get_error_msg(), last_err.get_error_code())
-        monitor.update_err(file_id,
-                           src_path="cos://%s/%s" % (bucket, cos_key),
+        monitor.update_err(src_path="cos://%s/%s" % (bucket, cos_key),
                            dest_path=local_path,
                            reason=err_reason,
                            request_id=last_err.get_request_id())
@@ -112,7 +236,10 @@ def _download_single(client, bucket, cos_key, local_path,
 
 
 def _download_directory(client, bucket, prefix, local_dir, include, exclude,
-                        thread_num, routines, part_size, rate_limiting, version_id, log_file="", retry=3):
+                        thread_num, routines, part_size, rate_limiting, version_id, log_file="", retry=3,
+                        err_retry_num=0, err_retry_interval=0,
+                        only_current_dir=False, disable_crc64=False, forbid_overwrite=False,
+                        sse_customer_algorithm="", sse_customer_key="", sse_customer_key_md5=""):
     """递归下载 COS 前缀下的所有对象
     - thread_num: 单文件分块并发（传给 SDK MAXThread）
     - routines: 文件间并发（同时下载的文件数）
@@ -126,14 +253,19 @@ def _download_directory(client, bucket, prefix, local_dir, include, exclude,
     total_size = 0
     skip_count = 0
     marker = ""
+    # only_current_dir 时使用 delimiter=/ 只列当前层
+    list_delimiter = "/" if only_current_dir else ""
 
     while True:
-        response = client.list_objects(
-            Bucket=bucket,
-            Prefix=prefix,
-            Marker=marker,
-            MaxKeys=1000,
-        )
+        list_kwargs = {
+            "Bucket": bucket,
+            "Prefix": prefix,
+            "Marker": marker,
+            "MaxKeys": 1000,
+        }
+        if list_delimiter:
+            list_kwargs["Delimiter"] = list_delimiter
+        response = client.list_objects(**list_kwargs)
 
         if "Contents" in response:
             for content in response["Contents"]:
@@ -159,6 +291,12 @@ def _download_directory(client, bucket, prefix, local_dir, include, exclude,
 
                 file_size = int(content.get("Size", 0))
                 local_file = os.path.join(local_dir, rel_key.replace("/", os.sep))
+
+                # forbid_overwrite：已存在则跳过
+                if forbid_overwrite and os.path.exists(local_file):
+                    skip_count += 1
+                    continue
+
                 total_size += file_size
                 tasks.append((key, local_file, file_size))
 
@@ -188,26 +326,19 @@ def _download_directory(client, bucket, prefix, local_dir, include, exclude,
 
     def _do_download(key, local_file, file_size):
         """单个文件下载任务（含重试）"""
-        last_err = None
-        progress_cb, file_id = monitor.create_progress_callback(file_size)
-        for attempt in range(max(1, retry + 1)):
-            try:
-                _ensure_dir(local_file)
-                kwargs = _build_download_kwargs(bucket, key, local_file,
-                                                thread_num, part_size, rate_limiting, version_id)
-                kwargs["progress_callback"] = progress_cb
-                client.download_file(**kwargs)
-                monitor.update_ok(file_size, file_id)
-                last_err = None
-                break
-            except CosServiceError as e:
-                last_err = e
-                if attempt < retry:
-                    progress_cb, file_id = monitor.create_progress_callback(file_size)
+        _ensure_dir(local_file)
+
+        def _build():
+            return _build_download_kwargs(bucket, key, local_file,
+                                          thread_num, part_size, rate_limiting, version_id,
+                                          sse_customer_algorithm, sse_customer_key, sse_customer_key_md5)
+
+        last_err = _download_with_retry(client, monitor, key, local_file, file_size,
+                                        _build, retry, err_retry_num, err_retry_interval,
+                                        bucket, disable_crc64, version_id)
         if last_err is not None:
             err_reason = "%s (Code: %s)" % (last_err.get_error_msg(), last_err.get_error_code())
-            monitor.update_err(file_id,
-                               src_path="cos://%s/%s" % (bucket, key),
+            monitor.update_err(src_path="cos://%s/%s" % (bucket, key),
                                dest_path=local_file,
                                reason=err_reason,
                                request_id=last_err.get_request_id())

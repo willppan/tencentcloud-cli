@@ -6,9 +6,12 @@ upload 操作：上传本地文件到 COS
 - routines: 文件间并发数（同时上传的文件数）
 """
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from qcloud_cos import CosServiceError
-from .utils import init_cos_client, match_filters, parse_meta, TransferProgressMonitor
+from .utils import (init_cos_client, match_filters, parse_meta,
+                    build_extra_put_headers, TransferProgressMonitor,
+                    calculate_local_crc64)
 
 
 def upload_object(args, parsed_globals):
@@ -32,7 +35,32 @@ def upload_object(args, parsed_globals):
     if retry is None:
         retry = 3
     retry = int(retry)
+
+    # === coscli 对齐扩展参数 ===
+    # 日志
     log_file = args.get("log_file", "") or ""
+    fail_output = args.get("fail_output", False)
+    fail_output_path = args.get("fail_output_path", "") or ""
+    # 仅当启用 fail_output 时才写日志；若同时指定 log_file，则 log_file 优先
+    effective_log = log_file or (fail_output_path if fail_output else "")
+
+    # 可重试错误的额外控制
+    err_retry_num = int(args.get("err_retry_num", 0) or 0)
+    err_retry_interval = int(args.get("err_retry_interval", 0) or 0)
+
+    # 范围控制
+    only_current_dir = args.get("only_current_dir", False)
+    skip_dir = args.get("skip_dir", False)
+
+    # 校验开关
+    disable_crc64 = args.get("disable_crc64", False)
+
+    # 符号链接
+    disable_all_symlink = args.get("disable_all_symlink", False)
+    enable_symlink_dir = args.get("enable_symlink_dir", False)
+
+    # 构造扩展头（ACL/SSE/tags/forbid_overwrite）
+    extra_headers = build_extra_put_headers(args)
 
     # 解析自定义元数据
     metadata = parse_meta(meta)
@@ -50,7 +78,15 @@ def upload_object(args, parsed_globals):
                     cos_key = dir_name + "/"
             _upload_directory(client, bucket, local_path, cos_key, include, exclude,
                               storage_class, content_type, metadata, thread_num, routines,
-                              part_size, rate_limiting, retry, log_file)
+                              part_size, rate_limiting, retry, effective_log,
+                              extra_headers=extra_headers,
+                              err_retry_num=err_retry_num,
+                              err_retry_interval=err_retry_interval,
+                              only_current_dir=only_current_dir,
+                              skip_dir=skip_dir,
+                              disable_crc64=disable_crc64,
+                              disable_all_symlink=disable_all_symlink,
+                              enable_symlink_dir=enable_symlink_dir)
         else:
             if not os.path.exists(local_path):
                 print("Error: 本地文件不存在: %s" % local_path)
@@ -60,7 +96,12 @@ def upload_object(args, parsed_globals):
                 return
 
             _upload_single(client, bucket, local_path, cos_key,
-                           storage_class, content_type, metadata, thread_num, part_size, rate_limiting, retry, log_file)
+                           storage_class, content_type, metadata, thread_num, part_size,
+                           rate_limiting, retry, effective_log,
+                           extra_headers=extra_headers,
+                           err_retry_num=err_retry_num,
+                           err_retry_interval=err_retry_interval,
+                           disable_crc64=disable_crc64)
 
     except CosServiceError as e:
         print("Error: %s (Code: %s, RequestId: %s)" % (
@@ -70,7 +111,8 @@ def upload_object(args, parsed_globals):
 
 
 def _build_upload_kwargs(bucket, local_path, cos_key, storage_class, content_type,
-                         metadata, thread_num, part_size, rate_limiting):
+                         metadata, thread_num, part_size, rate_limiting,
+                         extra_headers=None):
     """构造 upload_file 的参数"""
     kwargs = {
         "Bucket": bucket,
@@ -87,37 +129,106 @@ def _build_upload_kwargs(bucket, local_path, cos_key, storage_class, content_typ
         kwargs["Metadata"] = metadata
     if rate_limiting:
         kwargs["TrafficLimit"] = str(int(rate_limiting) * 1024 * 1024 * 8)
+    if extra_headers:
+        kwargs.update(extra_headers)
     return kwargs
 
 
+def _is_retryable_error(e):
+    """判断 CosServiceError 是否属于可重试错误（服务端错误/网络超时类）。"""
+    try:
+        code = int(e.get_status_code() or 0)
+    except Exception:
+        code = 0
+    return code == 0 or code >= 500 or code in (408, 429)
+
+
+def _verify_crc64(client, bucket, cos_key, local_path):
+    """上传后 CRC64 校验，返回 (ok, msg)"""
+    try:
+        head = client.head_object(Bucket=bucket, Key=cos_key)
+    except Exception as e:
+        return False, "head_object 失败: %s" % str(e)
+    cos_crc = head.get("x-cos-hash-crc64ecma", "")
+    if not cos_crc:
+        return True, ""  # 服务端未返回，视为通过
+    local_crc = calculate_local_crc64(local_path)
+    if local_crc is None:
+        return True, ""  # 本地无法计算（未安装 crcmod），跳过
+    if local_crc != cos_crc:
+        return False, "CRC64 不一致（本地=%s, COS=%s）" % (local_crc, cos_crc)
+    return True, ""
+
+
+def _upload_with_retry(client, monitor, full_path, cos_key, file_size,
+                       build_kwargs, retry, err_retry_num, err_retry_interval,
+                       bucket, disable_crc64):
+    """封装上传 + 重试 + CRC64 校验的通用逻辑。"""
+    last_err = None
+    progress_cb, file_id = monitor.create_progress_callback(file_size)
+    # 总重试次数 = retry + err_retry_num（err_retry_num 仅对"可重试错误"生效）
+    total_attempts = max(1, retry + 1)
+    for attempt in range(total_attempts):
+        try:
+            kwargs = build_kwargs()
+            kwargs["progress_callback"] = progress_cb
+            client.upload_file(**kwargs)
+            # 校验 CRC64
+            if not disable_crc64:
+                ok, msg = _verify_crc64(client, bucket, cos_key, full_path)
+                if not ok:
+                    raise CosServiceError("PUT", "CRC64Mismatch", 400, "CRC64Mismatch", msg, "")
+            monitor.update_ok(file_size, file_id)
+            return None
+        except CosServiceError as e:
+            last_err = e
+            if attempt < total_attempts - 1:
+                progress_cb, file_id = monitor.create_progress_callback(file_size)
+            elif err_retry_num > 0 and _is_retryable_error(e):
+                # 超出 retry 后，若为可重试错误，再重试 err_retry_num 次
+                for extra in range(err_retry_num):
+                    if err_retry_interval > 0:
+                        time.sleep(err_retry_interval)
+                    progress_cb, file_id = monitor.create_progress_callback(file_size)
+                    try:
+                        kwargs = build_kwargs()
+                        kwargs["progress_callback"] = progress_cb
+                        client.upload_file(**kwargs)
+                        if not disable_crc64:
+                            ok, msg = _verify_crc64(client, bucket, cos_key, full_path)
+                            if not ok:
+                                raise CosServiceError("PUT", "CRC64Mismatch", 400,
+                                                      "CRC64Mismatch", msg, "")
+                        monitor.update_ok(file_size, file_id)
+                        return None
+                    except CosServiceError as e2:
+                        last_err = e2
+    return last_err
+
+
 def _upload_single(client, bucket, local_path, cos_key,
-                   storage_class, content_type, metadata, thread_num, part_size, rate_limiting, retry=3, log_file=""):
+                   storage_class, content_type, metadata, thread_num, part_size,
+                   rate_limiting, retry=3, log_file="",
+                   extra_headers=None, err_retry_num=0, err_retry_interval=0,
+                   disable_crc64=False):
     """上传单个文件（带进度监控）"""
     monitor = TransferProgressMonitor("upload")
     file_size = os.path.getsize(local_path)
     monitor.set_scan_info(1, file_size)
     monitor.start()
 
-    progress_cb, file_id = monitor.create_progress_callback(file_size)
-    last_err = None
-    for attempt in range(max(1, retry + 1)):
-        try:
-            kwargs = _build_upload_kwargs(bucket, local_path, cos_key, storage_class, content_type,
-                                          metadata, thread_num, part_size, rate_limiting)
-            kwargs["progress_callback"] = progress_cb
-            client.upload_file(**kwargs)
-            monitor.update_ok(file_size, file_id)
-            last_err = None
-            break
-        except CosServiceError as e:
-            last_err = e
-            if attempt < retry:
-                # 重置该文件的进度，准备重试
-                progress_cb, file_id = monitor.create_progress_callback(file_size)
+    def _build():
+        return _build_upload_kwargs(bucket, local_path, cos_key, storage_class, content_type,
+                                    metadata, thread_num, part_size, rate_limiting,
+                                    extra_headers=extra_headers)
+
+    last_err = _upload_with_retry(client, monitor, local_path, cos_key, file_size,
+                                  _build, retry, err_retry_num, err_retry_interval,
+                                  bucket, disable_crc64)
+
     if last_err is not None:
         err_reason = "%s (Code: %s)" % (last_err.get_error_msg(), last_err.get_error_code())
-        monitor.update_err(file_id,
-                           src_path=local_path,
+        monitor.update_err(src_path=local_path,
                            dest_path="cos://%s/%s" % (bucket, cos_key),
                            reason=err_reason,
                            request_id=last_err.get_request_id())
@@ -128,7 +239,11 @@ def _upload_single(client, bucket, local_path, cos_key,
 
 def _upload_directory(client, bucket, local_dir, cos_prefix, include, exclude,
                       storage_class, content_type, metadata, thread_num, routines,
-                      part_size, rate_limiting, retry=3, log_file=""):
+                      part_size, rate_limiting, retry=3, log_file="",
+                      extra_headers=None, err_retry_num=0, err_retry_interval=0,
+                      only_current_dir=False, skip_dir=False,
+                      disable_crc64=False,
+                      disable_all_symlink=False, enable_symlink_dir=False):
     """递归上传目录
     - thread_num: 单文件分块并发（传给 SDK MAXThread）
     - routines: 文件间并发（同时上传的文件数）
@@ -141,16 +256,31 @@ def _upload_directory(client, bucket, local_dir, cos_prefix, include, exclude,
     empty_dir_keys = []  # 空目录对应的 COS key（以 / 结尾的空对象）
     total_size = 0
     skip_count = 0
-    for root, dirs, files in os.walk(local_dir):
-        # 检测空目录：当前目录下没有文件，且没有子目录（或子目录也都是空的）
-        # 简单判断：当前 root 下既无文件也无子目录，则为空目录
-        if not files and not dirs:
+
+    # 决定遍历方式
+    if only_current_dir:
+        # 仅当前一层
+        walker = [(local_dir, [], [f for f in os.listdir(local_dir)
+                                    if os.path.isfile(os.path.join(local_dir, f))])]
+    else:
+        # followlinks 控制是否跟随符号链接目录
+        followlinks = enable_symlink_dir and not disable_all_symlink
+        walker = os.walk(local_dir, followlinks=followlinks)
+
+    for root, dirs, files in walker:
+        # 过滤符号链接目录（在 walk 过程中）
+        if not only_current_dir:
+            if disable_all_symlink:
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+            elif not enable_symlink_dir:
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+
+        # 检测空目录（仅在不 skip_dir 时创建目录标记）
+        if not skip_dir and not files and not dirs:
             rel_dir = os.path.relpath(root, local_dir).replace(os.sep, "/")
             if rel_dir == ".":
-                # 根目录本身为空
                 dir_key = cos_prefix.rstrip("/") + "/" if cos_prefix else ""
             else:
-                # include/exclude 过滤目录
                 if not match_filters(rel_dir, include, exclude):
                     skip_count += 1
                     continue
@@ -166,6 +296,12 @@ def _upload_directory(client, bucket, local_dir, cos_prefix, include, exclude,
 
         for filename in files:
             full_path = os.path.join(root, filename)
+
+            # 过滤符号链接文件
+            if disable_all_symlink and os.path.islink(full_path):
+                skip_count += 1
+                continue
+
             rel_path = os.path.relpath(full_path, local_dir).replace(os.sep, "/")
 
             # include/exclude 过滤
@@ -182,7 +318,11 @@ def _upload_directory(client, bucket, local_dir, cos_prefix, include, exclude,
             else:
                 key = rel_path
 
-            file_size = os.path.getsize(full_path)
+            try:
+                file_size = os.path.getsize(full_path)
+            except OSError:
+                skip_count += 1
+                continue
             total_size += file_size
             tasks.append((full_path, key, file_size))
 
@@ -193,26 +333,17 @@ def _upload_directory(client, bucket, local_dir, cos_prefix, include, exclude,
 
     def _do_upload(full_path, key, file_size):
         """单个文件上传任务（含重试）"""
-        last_err = None
-        progress_cb, file_id = monitor.create_progress_callback(file_size)
-        for attempt in range(max(1, retry + 1)):
-            try:
-                kwargs = _build_upload_kwargs(bucket, full_path, key, storage_class, content_type,
-                                              metadata, thread_num, part_size, rate_limiting)
-                kwargs["progress_callback"] = progress_cb
-                client.upload_file(**kwargs)
-                monitor.update_ok(file_size, file_id)
-                last_err = None
-                break
-            except CosServiceError as e:
-                last_err = e
-                if attempt < retry:
-                    # 重置该文件的进度，准备重试
-                    progress_cb, file_id = monitor.create_progress_callback(file_size)
+        def _build():
+            return _build_upload_kwargs(bucket, full_path, key, storage_class, content_type,
+                                        metadata, thread_num, part_size, rate_limiting,
+                                        extra_headers=extra_headers)
+
+        last_err = _upload_with_retry(client, monitor, full_path, key, file_size,
+                                      _build, retry, err_retry_num, err_retry_interval,
+                                      bucket, disable_crc64)
         if last_err is not None:
             err_reason = "%s (Code: %s)" % (last_err.get_error_msg(), last_err.get_error_code())
-            monitor.update_err(file_id,
-                               src_path=full_path,
+            monitor.update_err(src_path=full_path,
                                dest_path="cos://%s/%s" % (bucket, key),
                                reason=err_reason,
                                request_id=last_err.get_request_id())
@@ -227,14 +358,15 @@ def _upload_directory(client, bucket, local_dir, cos_prefix, include, exclude,
             for future in as_completed(futures):
                 future.result()
 
-    # 在 COS 上创建空目录标记（以 / 结尾的空对象）
-    for dir_key in empty_dir_keys:
-        try:
-            client.put_object(Bucket=bucket, Key=dir_key, Body=b"")
-            monitor.update_ok(0)
-        except CosServiceError as e:
-            monitor.update_err(src_path=dir_key,
-                               reason="创建空目录失败: %s (Code: %s)" % (e.get_error_msg(), e.get_error_code()),
-                               request_id=e.get_request_id())
+    # 在 COS 上创建空目录标记（以 / 结尾的空对象），skip_dir 时跳过
+    if not skip_dir:
+        for dir_key in empty_dir_keys:
+            try:
+                client.put_object(Bucket=bucket, Key=dir_key, Body=b"")
+                monitor.update_ok(0)
+            except CosServiceError as e:
+                monitor.update_err(src_path=dir_key,
+                                   reason="创建空目录失败: %s (Code: %s)" % (e.get_error_msg(), e.get_error_code()),
+                                   request_id=e.get_request_id())
 
     monitor.stop(log_file=log_file)
